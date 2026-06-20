@@ -7,7 +7,7 @@
 //! 16x16 macroblocks, CABAC-only entropy with its own context tables, and motion
 //! that uses merge / AMVP candidate lists rather than H.264's median predictor.
 //!
-//! Staged like the H.264 build (see `thesis.rs`):
+//! Staged like the H.264 build (see `custom.rs`):
 //!   rung 1 (this file): bitstream foundation — 2-byte NAL split (Annex-B +
 //!     hvcC length-prefix), profile_tier_level, SPS, PPS, and slice-segment
 //!     header far enough to classify every slice (I/P/B) and find picture
@@ -20,7 +20,7 @@
 //! Correct MV output is impossible before rung 3 (CABAC must stay in sync), so
 //! this rung reports structure only — exactly as H.264 rung 1 did.
 
-use crate::thesis::{ebsp_to_rbsp, BitReader};
+use crate::custom::{ebsp_to_rbsp, BitReader};
 
 // NAL unit types we care about (ITU-T H.265 Table 7-1). VCL slices are 0..=31;
 // the IRAP range 16..=23 carries IDR/BLA/CRA pictures.

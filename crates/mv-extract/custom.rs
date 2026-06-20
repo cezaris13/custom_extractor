@@ -25,14 +25,14 @@
 
 // CAVLC residual decoding lives in a sibling file to keep the big VLC tables
 // out of this parser. Declared with #[path] so `thesis` stays a single-file
-// module (lib.rs: `pub mod thesis;`).
-#[path = "thesis_cavlc.rs"]
+// module (lib.rs: `pub mod custom;`).
+#[path = "custom_cavlc.rs"]
 pub mod cavlc;
-#[path = "thesis_slice.rs"]
+#[path = "custom_slice.rs"]
 pub mod slice;
-#[path = "thesis_cabac_tables.rs"]
-pub mod thesis_cabac_tables;
-#[path = "thesis_cabac.rs"]
+#[path = "custom_cabac_tables.rs"]
+pub mod custom_cabac_tables;
+#[path = "custom_cabac.rs"]
 pub mod cabac;
 
 /// MSB-first bit reader over an RBSP buffer, with the Exp-Golomb helpers the

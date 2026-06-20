@@ -3,7 +3,7 @@
 //! libavformat is used ONLY to demux the container into H.264 packets +
 //! extradata. Everything past that — NAL split, parameter sets, slice headers,
 //! CAVLC entropy decode, macroblock layer and MV prediction — is hand-rolled in
-//! `mv_extract::thesis`, never touching libavcodec's decode path (thesis Ch4).
+//! `mv_extract::custom`, never touching libavcodec's decode path (thesis Ch4).
 //!
 //! Status: CAVLC and CABAC P/I slices produce motion vectors in FFmpeg's
 //! AV_FRAME_DATA_MOTION_VECTORS layout, bit-identical to extractor1 (verified on
@@ -35,8 +35,8 @@ use ffmpeg_sys_next as ff;
 
 use mv_extract::ffmpeg_common::{get_current_rss_kb, open_mv_compact_writer, ExtractorArgs, FileMvCompactWriter};
 use mv_extract::hevc;
-use mv_extract::thesis::slice::{decode_slice, decode_slice_cabac, FrameGrids};
-use mv_extract::thesis::{
+use mv_extract::custom::slice::{decode_slice, decode_slice_cabac, FrameGrids};
+use mv_extract::custom::{
     parse_avcc, parse_pps, parse_slice_header, parse_slice_header_into, parse_sps, split_annexb,
     split_avcc, BitReader, Nal, Pps, SliceType, Sps,
 };

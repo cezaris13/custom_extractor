@@ -15,7 +15,7 @@
 //! mb_skip/mb_type/ref/mvd, residual significance maps) is a later installment;
 //! it reuses the same grids/prediction/export as the CAVLC path.
 
-use super::thesis_cabac_tables::{CTX_INIT_I, CTX_INIT_PB, LPS_RANGE, MLPS_STATE, NORM_SHIFT};
+use super::custom_cabac_tables::{CTX_INIT_I, CTX_INIT_PB, LPS_RANGE, MLPS_STATE, NORM_SHIFT};
 
 const CABAC_MASK: i64 = 0xFFFF; // (1 << CABAC_BITS) - 1, CABAC_BITS = 16
 

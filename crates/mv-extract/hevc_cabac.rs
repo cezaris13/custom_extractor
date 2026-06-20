@@ -2,13 +2,13 @@
 //!
 //! HEVC's arithmetic decoding engine is identical to H.264's (FFmpeg's HEVC
 //! decoder uses the same `libavcodec/cabac.h` core), so the engine itself is
-//! reused verbatim from the H.264 path — see `crate::thesis::cabac::Cabac`.
+//! reused verbatim from the H.264 path — see `crate::custom::cabac::Cabac`.
 //! Only context *initialisation* differs: 179 contexts, three init types, and
 //! `m`/`n` derived from a single init byte (ITU-T H.265 §9.3.2.2) rather than
 //! looked up as a pair. Init values come from `hevc_cabac_tables.rs` (generated
 //! from FFmpeg by scripts/gen_hevc_cabac_tables.py).
 
-pub use crate::thesis::cabac::Cabac;
+pub use crate::custom::cabac::Cabac;
 use crate::hevc::SliceType;
 use crate::hevc_cabac_tables::{HEVC_CONTEXTS, INIT_VALUES};
 

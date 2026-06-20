@@ -22,7 +22,7 @@ name = "mv_extract"
 path = "lib.rs"
 
 # Thesis from-scratch compressed-domain extractor (hand-rolled H.264 + HEVC
-# parsers; libavformat used only for container demux). See thesis.rs / hevc.rs.
+# parsers; libavformat used only for container demux). See custom.rs / hevc.rs.
 [[bin]]
-name = "extractor9"
-path = "extractor9.rs"
+name = "extractor"
+path = "extractor.rs"

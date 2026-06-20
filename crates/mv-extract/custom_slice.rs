@@ -930,7 +930,7 @@ const GOLOMB_TO_INTRA_CBP: [u8; 48] = [
 // ═════════════════════════════════════════════════════════════════════════════
 
 use super::cabac::{init_states, Cabac};
-use super::thesis_cabac_tables::{LAST_COEFF_8X8, SIG_OFF_8X8};
+use super::custom_cabac_tables::{LAST_COEFF_8X8, SIG_OFF_8X8};
 
 // Residual context base offsets (non-MBAFF row), categories 0..4:
 // 0=LumaDC16, 1=LumaAC16, 2=Luma4x4, 3=ChromaDC, 4=ChromaAC.
