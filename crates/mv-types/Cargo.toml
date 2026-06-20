@@ -1,0 +1,12 @@
+[package]
+name = "mv-types"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "mv_types"
+path = "lib.rs"
+
+[dependencies]
+itoa = "1"
+ryu = "1"
