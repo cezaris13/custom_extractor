@@ -31,6 +31,21 @@ pub struct ExtractorArgs {
     pub output_file: String,
     pub is_verbose: bool,
     pub is_single_threaded: bool,
+    /// Opt-in H.264 B-slice (bi-predictive) decode. Off by default so the CLI
+    /// contract and output stay unchanged for existing callers/scripts;
+    /// enabled via `E9_B_SLICES=1` rather than a new positional argument.
+    /// Forces the serial decode path (B-slice direct mode needs the DPB of
+    /// already-decoded reference pictures, which the parallel worker-pool
+    /// path doesn't have).
+    pub decode_b_slices: bool,
+    /// Opt-in: drop list-1 (`source > 0`, forward-reference) rows from the
+    /// export, keeping only list-0. Matches the custom FFmpeg fork's
+    /// `mv_l0_only` AVOption (set unconditionally by extractor1/3/5/6) — off
+    /// by default here since this decoder's whole point is the complete
+    /// motion field, not reproducing that debug-mode subset. Enabled via
+    /// `E9_L0_ONLY=1` rather than a new positional argument, matching
+    /// `E9_B_SLICES`'s convention.
+    pub l0_only: bool,
 }
 
 impl ExtractorArgs {
@@ -50,6 +65,8 @@ impl ExtractorArgs {
             output_file: argv[3].clone(),
             is_verbose: argv[4].parse::<i32>().unwrap_or(0) != 0,
             is_single_threaded: argv[5].parse::<i32>().unwrap_or(0) != 0,
+            decode_b_slices: std::env::var("E9_B_SLICES").map(|v| v != "0").unwrap_or(false),
+            l0_only: std::env::var("E9_L0_ONLY").map(|v| v != "0").unwrap_or(false),
         })
     }
 }

@@ -355,6 +355,7 @@ pub struct Sps {
     pub max_num_ref_frames: u32,
     pub frame_mbs_only_flag: bool,
     pub mb_adaptive_frame_field_flag: bool,
+    pub direct_8x8_inference_flag: bool,
     pub pic_width_in_mbs: u32,
     pub pic_height_in_map_units: u32,
 }
@@ -445,7 +446,8 @@ pub fn parse_sps(rbsp: &[u8]) -> Sps {
     if !s.frame_mbs_only_flag {
         s.mb_adaptive_frame_field_flag = r.read_bit() == 1;
     }
-    // Remaining fields (direct_8x8, cropping, VUI) are unused for MV extraction.
+    s.direct_8x8_inference_flag = r.read_bit() == 1;
+    // Remaining fields (cropping, VUI) are unused for MV extraction.
     s
 }
 

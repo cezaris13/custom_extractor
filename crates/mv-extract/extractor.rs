@@ -35,7 +35,7 @@ use ffmpeg_sys_next as ff;
 
 use mv_extract::ffmpeg_common::{get_current_rss_kb, open_mv_compact_writer, ExtractorArgs, FileMvCompactWriter};
 use mv_extract::hevc;
-use mv_extract::custom::slice::{decode_slice, decode_slice_cabac, FrameGrids};
+use mv_extract::custom::slice::{decode_slice, decode_slice_cabac, decode_slice_cabac_b, FrameGrids};
 use mv_extract::custom::{
     parse_avcc, parse_pps, parse_slice_header, parse_slice_header_into, parse_sps, split_annexb,
     split_avcc, BitReader, Nal, Pps, SliceType, Sps,
@@ -86,8 +86,9 @@ fn main() {
             );
         } else {
             eprintln!(
-                "extractor9 (thesis): pictures={} cavlc={} cabac={} b_skipped={} threads={}",
+                "extractor9 (thesis): pictures={} cavlc={} cabac={} b_skipped={} b_decoded={} b_unsupported={} threads={}",
                 stats.frames, stats.cavlc_decoded, stats.cabac_decoded, stats.b_skipped,
+                stats.b_decoded, stats.unsupported,
                 if args.is_single_threaded { 1 } else { worker_count() },
             );
             eprintln!(
@@ -104,6 +105,7 @@ struct Stats {
     cavlc_decoded: u64,
     cabac_decoded: u64,
     b_skipped: u64,
+    b_decoded: u64,
     incomplete: u64,
     parse_errors: u64,
     // HEVC rung-1 report (only populated for H.265 inputs).
@@ -140,12 +142,113 @@ struct SliceJob {
     pps: Pps,
 }
 
-/// All non-B slices of one coded picture, plus its output frame index and size.
+/// All kept slices of one coded picture, plus its output frame index and size.
+/// (Non-B slices always; B slices too when `decode_b_slices` is enabled.)
 struct Picture {
     frame_index: i32,
     mb_w: usize,
     mb_h: usize,
     jobs: Vec<SliceJob>,
+    /// Picture order count (ITU-T H.264 §8.2.1), `None` when
+    /// `pic_order_cnt_type != 0` — B-slice reference-list ordering needs POC,
+    /// so such streams fall back to skipping B slices entirely.
+    poc: Option<i32>,
+    /// `nal_ref_idc` of the picture's first slice: 0 means this picture is
+    /// never used as a reference and so never enters the DPB.
+    nal_ref_idc: u8,
+}
+
+/// One decoded reference (I/P, or a reference B — hierarchical/pyramid B)
+/// picture retained across pictures for B-slice direct-mode colocated
+/// lookups. Snapshots `FrameGrids`'s motion/ref grids right after decode,
+/// since the grid buffer itself gets reset and reused for the next picture.
+/// `mv1`/`refi1` are populated only for reference B pictures (list 1 doesn't
+/// exist for I/P) — see `custom::slice::ColPic`.
+struct H264RefFrame {
+    poc: i32,
+    bw: usize,
+    mv: Vec<[i32; 2]>,
+    refi: Vec<i32>,
+    mv1: Option<Vec<[i32; 2]>>,
+    refi1: Option<Vec<i32>>,
+    col_shape: Vec<mv_extract::custom::slice::ColShape>,
+}
+
+impl H264RefFrame {
+    fn as_col_pic(&self) -> mv_extract::custom::slice::ColPic<'_> {
+        mv_extract::custom::slice::ColPic {
+            bw: self.bw,
+            mv0: &self.mv,
+            refi0: &self.refi,
+            mv1: self.mv1.as_deref(),
+            refi1: self.refi1.as_deref(),
+            col_shape: &self.col_shape,
+        }
+    }
+}
+
+/// Compute the H.264 picture order count for `pic_order_cnt_type == 0`
+/// (ITU-T H.264 §8.2.1.1). `prev_msb`/`prev_lsb` hold the previous *reference*
+/// picture's PicOrderCntMsb/pic_order_cnt_lsb and are updated in place;
+/// the caller resets them to 0 at each IDR. Other `pic_order_cnt_type` values
+/// aren't reconstructed (returns `None`).
+fn h264_compute_poc(
+    sps: &Sps,
+    pic_order_cnt_lsb: u32,
+    nal_ref_idc: u8,
+    prev_msb: &mut i32,
+    prev_lsb: &mut i32,
+) -> Option<i32> {
+    if sps.pic_order_cnt_type != 0 {
+        return None;
+    }
+    let max_lsb = 1i32 << sps.log2_max_pic_order_cnt_lsb;
+    let lsb = pic_order_cnt_lsb as i32;
+    let msb = if lsb < *prev_lsb && (*prev_lsb - lsb) >= max_lsb / 2 {
+        *prev_msb + max_lsb
+    } else if lsb > *prev_lsb && (lsb - *prev_lsb) > max_lsb / 2 {
+        *prev_msb - max_lsb
+    } else {
+        *prev_msb
+    };
+    if nal_ref_idc != 0 {
+        *prev_msb = msb;
+        *prev_lsb = lsb;
+    }
+    Some(msb + lsb)
+}
+
+/// Cycle `primary` then `secondary` until `nb` entries are collected (ITU-T
+/// H.264 §8.2.4.2.3 list construction), operating on DPB indices directly.
+fn pad_ref_list(primary: &[usize], secondary: &[usize], nb: usize) -> Vec<usize> {
+    let mut out = Vec::new();
+    if primary.is_empty() && secondary.is_empty() {
+        return out;
+    }
+    while out.len() < nb {
+        out.extend_from_slice(primary);
+        out.extend_from_slice(secondary);
+    }
+    out.truncate(nb);
+    out
+}
+
+/// RefPicList1[0] — the collocated picture used by spatial direct mode
+/// (ITU-T H.264 §8.2.4.2.3, short-term-only, no explicit reordering: `ref_pic_
+/// list_modification` is parsed but not applied elsewhere in this decoder
+/// either). `None` when the DPB has nothing to reference yet.
+fn h264_col_pic(dpb: &[H264RefFrame], cur_poc: i32, nb_l0: usize, nb_l1: usize) -> Option<usize> {
+    let mut before: Vec<usize> = (0..dpb.len()).filter(|&i| dpb[i].poc < cur_poc).collect();
+    before.sort_by_key(|&i| std::cmp::Reverse(dpb[i].poc)); // nearest past first
+    let mut after: Vec<usize> = (0..dpb.len()).filter(|&i| dpb[i].poc > cur_poc).collect();
+    after.sort_by_key(|&i| dpb[i].poc); // nearest future first
+
+    let l0 = pad_ref_list(&before, &after, nb_l0.max(1));
+    let mut l1 = pad_ref_list(&after, &before, nb_l1.max(1));
+    if l1.len() > 1 && l0.len() == l1.len() && l0 == l1 {
+        l1.swap(0, 1);
+    }
+    l1.first().copied()
 }
 
 fn worker_count() -> usize {
@@ -166,7 +269,10 @@ unsafe fn run(
     if detect_codec(args) == ff::AVCodecID::AV_CODEC_ID_HEVC {
         return run_hevc(args, writer);
     }
-    if args.is_single_threaded {
+    // B-slice decode needs the DPB of already-decoded reference pictures in
+    // POC order, which the parallel worker-pool path doesn't have (workers
+    // decode pictures independently, out of order) — force serial.
+    if args.is_single_threaded || args.decode_b_slices {
         run_serial(args, writer)
     } else {
         run_threaded(args, writer)
@@ -445,10 +551,11 @@ unsafe fn run_serial(
     let mut stats = Stats::default();
     let mut grid: Option<FrameGrids> = None;
     let mut out = Vec::new();
+    let mut dpb: Vec<H264RefFrame> = Vec::new();
 
     let (frames, b_skipped) = demux_pictures(args, |p| {
         out.clear();
-        decode_picture(&p, &mut grid, &mut out, &mut stats);
+        decode_picture(&p, &mut grid, &mut out, &mut stats, &mut dpb, args.decode_b_slices, args.l0_only);
         if let Some(w) = writer.as_mut() {
             for mv in &out {
                 let _ = w.write(mv);
@@ -474,6 +581,7 @@ unsafe fn run_threaded(
     let (work_tx, work_rx) = mpsc::sync_channel::<Picture>(nthreads * 2);
     let work_rx = Arc::new(Mutex::new(work_rx));
     let (res_tx, res_rx) = mpsc::channel::<(i32, Vec<MvCompact>, Stats)>();
+    let l0_only = args.l0_only;
 
     let mut workers = Vec::with_capacity(nthreads);
     for _ in 0..nthreads {
@@ -488,7 +596,9 @@ unsafe fn run_threaded(
                 let Ok(p) = job else { break };
                 let mut out = Vec::new();
                 let mut st = Stats::default();
-                decode_picture(&p, &mut grid, &mut out, &mut st);
+                // decode_b_slices is never set here: `run()` forces the serial
+                // path whenever it is, since B decode needs the DPB.
+                decode_picture(&p, &mut grid, &mut out, &mut st, &mut Vec::new(), false, l0_only);
                 let _ = tx.send((p.frame_index, out, st));
             }
         }));
@@ -532,23 +642,72 @@ unsafe fn run_threaded(
 }
 
 /// Decode every slice of `p` into a reused `FrameGrids` and append its motion
-/// vectors to `out`. Shared by both the serial and threaded paths.
-fn decode_picture(p: &Picture, grid: &mut Option<FrameGrids>, out: &mut Vec<MvCompact>, st: &mut Stats) {
+/// vectors to `out`. Shared by both the serial and threaded paths — the
+/// threaded path always passes `b_enabled = false` (see its call site), since
+/// B-slice decode's DPB dependency needs pictures decoded in order.
+fn decode_picture(
+    p: &Picture,
+    grid: &mut Option<FrameGrids>,
+    out: &mut Vec<MvCompact>,
+    st: &mut Stats,
+    dpb: &mut Vec<H264RefFrame>,
+    b_enabled: bool,
+    l0_only: bool,
+) {
     if p.jobs.is_empty() {
         return; // B-only / empty picture: still a frame, but emits no MVs
     }
     let cabac = p.jobs[0].pps.entropy_coding_mode_flag;
+    let chroma422 = p.jobs[0].sps.chroma_format_idc == 2;
     match grid {
-        Some(g) if g.dims() == (p.mb_w, p.mb_h) => g.reset(cabac),
-        _ => *grid = Some(FrameGrids::new(p.mb_w, p.mb_h)),
+        Some(g) if g.dims() == (p.mb_w, p.mb_h) && g.is_chroma422() == chroma422 => g.reset(cabac),
+        _ => *grid = Some(FrameGrids::new(p.mb_w, p.mb_h, chroma422)),
     }
     let g = grid.as_mut().unwrap();
+
+    // Resolved once per picture, lazily, only if it turns out to contain B
+    // slices (most pictures don't).
+    let mut col_idx: Option<Option<usize>> = None;
+    let mut any_b = false;
 
     // sid is per-picture (slice index): only its distinctness within the
     // picture matters for same-slice neighbour checks.
     for (sid, job) in p.jobs.iter().enumerate() {
         let mut r = BitReader::new(&job.nal.rbsp);
         let sh = parse_slice_header_into(&mut r, &job.nal, &job.sps, &job.pps);
+
+        if matches!(sh.slice_type, SliceType::B) {
+            any_b = true;
+            let supported = b_enabled
+                && job.pps.entropy_coding_mode_flag
+                && sh.direct_spatial_mv_pred_flag
+                && job.sps.direct_8x8_inference_flag
+                && p.poc.is_some();
+            if !supported {
+                st.unsupported += 1;
+                continue;
+            }
+            let cur_poc = p.poc.unwrap();
+            let idx = *col_idx.get_or_insert_with(|| {
+                h264_col_pic(dpb, cur_poc, sh.num_ref_idx_l0_active as usize, sh.num_ref_idx_l1_active as usize)
+            });
+            let Some(ci) = idx else {
+                st.unsupported += 1; // no reference decoded yet (leading B / empty DPB)
+                continue;
+            };
+            let byte_start = r.pos().div_ceil(8);
+            st.b_decoded += 1;
+            let col = dpb[ci].as_col_pic();
+            let res = decode_slice_cabac_b(g, &job.nal.rbsp, byte_start, &sh, &job.pps, sid as i32, &col);
+            if !res.ok {
+                st.parse_errors += 1;
+            }
+            if sh.first_mb_in_slice as usize + res.mbs_decoded != g.mb_count() {
+                st.incomplete += 1;
+            }
+            continue;
+        }
+
         let res = if job.pps.entropy_coding_mode_flag {
             // CABAC: slice_data starts at the next byte boundary
             // (cabac_alignment_one_bit).
@@ -566,7 +725,30 @@ fn decode_picture(p: &Picture, grid: &mut Option<FrameGrids>, out: &mut Vec<MvCo
             st.incomplete += 1;
         }
     }
-    g.export_mvs_compact(p.frame_index, out);
+    g.export_mvs_compact(p.frame_index, l0_only, out);
+
+    // Snapshot into the DPB for future B pictures' direct mode. Any
+    // reference (nal_ref_idc != 0) picture qualifies, including reference B
+    // pictures (hierarchical/pyramid B, common with x264 b-pyramid) — those
+    // additionally snapshot list 1, needed by a later B picture's colZeroFlag
+    // list-1 fallback when this collocated picture didn't use list 0 for a
+    // given block (see `custom::slice::spatial_direct_quadrants`).
+    if b_enabled && p.nal_ref_idc != 0 {
+        if let Some(poc) = p.poc {
+            let (bw, mv, refi) = g.mv_refi_snapshot();
+            let (mv1, refi1) = if any_b {
+                let (mv1, refi1) = g.mv_refi1_snapshot();
+                (Some(mv1), Some(refi1))
+            } else {
+                (None, None)
+            };
+            let col_shape = g.col_shape_snapshot();
+            dpb.push(H264RefFrame { poc, bw, mv, refi, mv1, refi1, col_shape });
+            if dpb.len() > 16 {
+                dpb.remove(0);
+            }
+        }
+    }
 }
 
 /// Demux the container, split NALs, track SPS/PPS, and group coded slices into
@@ -624,6 +806,8 @@ unsafe fn demux_pictures(args: &ExtractorArgs, mut on_picture: impl FnMut(Pictur
     let mut cur: Option<Picture> = None;
     let mut next_index: i32 = 0;
     let mut b_skipped: u64 = 0;
+    let mut prev_poc_msb: i32 = 0;
+    let mut prev_poc_lsb: i32 = 0;
 
     let pkt = ff::av_packet_alloc();
     let mut pkt = pkt;
@@ -662,18 +846,29 @@ unsafe fn demux_pictures(args: &ExtractorArgs, mut on_picture: impl FnMut(Pictur
                             if let Some(prev) = cur.take() {
                                 on_picture(prev);
                             }
+                            let poc = h264_compute_poc(
+                                &sps,
+                                sh.pic_order_cnt_lsb,
+                                n.nal_ref_idc,
+                                &mut prev_poc_msb,
+                                &mut prev_poc_lsb,
+                            );
                             cur = Some(Picture {
                                 frame_index: next_index,
                                 mb_w: sps.pic_width_in_mbs as usize,
                                 mb_h: sps.frame_height_in_mbs() as usize,
                                 jobs: Vec::new(),
+                                poc,
+                                nal_ref_idc: n.nal_ref_idc,
                             });
                             next_index += 1;
                         }
 
-                        // B slices need bi/direct prediction (rung 4) — skip,
-                        // but the picture itself still counts as a frame.
-                        if matches!(sh.slice_type, SliceType::B) {
+                        // B slices need bi/direct prediction; decoded only when
+                        // enabled (needs a DPB, POC, and spatial direct mode —
+                        // see decode_picture). Otherwise skip, but the picture
+                        // itself still counts as a frame.
+                        if matches!(sh.slice_type, SliceType::B) && !args.decode_b_slices {
                             b_skipped += 1;
                             continue;
                         }
