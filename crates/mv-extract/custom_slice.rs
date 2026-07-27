@@ -1150,13 +1150,18 @@ impl FrameGrids {
             if l0_only && source > 0 {
                 return;
             }
+            let src_x = sx + mv[0] / 4;
+            let src_y = sy + mv[1] / 4;
+            if src_x == sx && src_y == sy {
+                return; // zero-size vector: no displacement, skip
+            }
             out.push(MotionVector {
                 frame,
                 source,
                 w,
                 h,
-                src_x: (sx + mv[0] / 4) as f64,
-                src_y: (sy + mv[1] / 4) as f64,
+                src_x: src_x as f64,
+                src_y: src_y as f64,
                 dst_x: sx as f64,
                 dst_y: sy as f64,
                 flags: 0,
@@ -1175,11 +1180,16 @@ impl FrameGrids {
             if l0_only && source > 0 {
                 return;
             }
+            let src_x = sx + mv[0] / 4;
+            let src_y = sy + mv[1] / 4;
+            if src_x == sx && src_y == sy {
+                return; // zero-size vector: no displacement, skip
+            }
             out.push(MvCompact {
                 frame,
                 source,
-                src_x: (sx + mv[0] / 4) as i16,
-                src_y: (sy + mv[1] / 4) as i16,
+                src_x: src_x as i16,
+                src_y: src_y as i16,
                 dst_x: sx as i16,
                 dst_y: sy as i16,
             });

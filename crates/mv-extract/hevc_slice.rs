@@ -809,13 +809,18 @@ fn export_frame_mvs(cx: &mut Ctx) {
                 } else {
                     m.ref_idx[1] as i32 + 1
                 };
+                let dst_x = src_x + (m.mv[dir][0] as i32 >> 2);
+                let dst_y = src_y + (m.mv[dir][1] as i32 >> 2);
+                if dst_x == src_x && dst_y == src_y {
+                    continue; // zero-size vector: no displacement, skip
+                }
                 cx.out.push(MvCompact {
                     frame,
                     source,
                     src_x: src_x as i16,
                     src_y: src_y as i16,
-                    dst_x: (src_x + (m.mv[dir][0] as i32 >> 2)) as i16,
-                    dst_y: (src_y + (m.mv[dir][1] as i32 >> 2)) as i16,
+                    dst_x: dst_x as i16,
+                    dst_y: dst_y as i16,
                 });
             }
         }

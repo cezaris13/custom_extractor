@@ -1,10 +1,12 @@
 use crate::motion_vector::{MotionVector, load_motion_vectors};
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::path::Path;
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+// Ord/PartialOrd are only needed for the final `diffs.sort_by` — the
+// first_map/second_map lookups below use Hash+Eq (HashMap), not ordering.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Key {
     pub frame: i32,
     pub src_x: i64,
@@ -34,105 +36,72 @@ impl Key {
     }
 }
 
-struct ValueColumns {
-    src_x: f64,
-    src_y: f64,
-    dst_x: f64,
-    dst_y: f64,
+/// Zero-size vector: source and destination points coincide (no displacement).
+fn is_zero_size(mv: &MotionVector) -> bool {
+    mv.src_x == mv.dst_x && mv.src_y == mv.dst_y
 }
 
-impl ValueColumns {
-    fn from_mv(mv: &MotionVector) -> Self {
-        ValueColumns {
-            src_x: mv.src_x,
-            src_y: mv.src_y,
-            dst_x: mv.dst_x,
-            dst_y: mv.dst_y,
+/// Compare the rows sharing one `Key` between the two files, field by field.
+/// Takes slices directly (no intermediate per-row `Vec<(&str, f64)>`
+/// allocation) since there are only ever four fixed float columns to check.
+fn compare_rows(key: &Key, f_rows: &[&MotionVector], s_rows: &[&MotionVector], diffs: &mut Vec<(Key, String)>) {
+    let count = f_rows.len().max(s_rows.len());
+    for i in 0..count {
+        match (f_rows.get(i), s_rows.get(i)) {
+            (None, Some(_)) => diffs.push((
+                key.clone(),
+                format!("{}: extra row in second file (index {})", key.display(), i),
+            )),
+            (Some(_), None) => diffs.push((
+                key.clone(),
+                format!("{}: extra row in first file (index {})", key.display(), i),
+            )),
+            (Some(f), Some(s)) => {
+                let mut cmp = |name: &str, v1: f64, v2: f64| {
+                    if v1 != v2 {
+                        diffs.push((
+                            key.clone(),
+                            format!("{}: '{}' differs (first={}, second={})", key.display(), name, v1, v2),
+                        ));
+                    }
+                };
+                cmp("src_x", f.src_x, s.src_x);
+                cmp("src_y", f.src_y, s.src_y);
+                cmp("dst_x", f.dst_x, s.dst_x);
+                cmp("dst_y", f.dst_y, s.dst_y);
+            }
+            (None, None) => unreachable!(),
         }
-    }
-
-    fn fields(&self) -> Vec<(&str, f64)> {
-        vec![
-            ("src_x", self.src_x),
-            ("src_y", self.src_y),
-            ("dst_x", self.dst_x),
-            ("dst_y", self.dst_y),
-        ]
     }
 }
 
 pub fn compare_frames(first: &[MotionVector], second: &[MotionVector]) -> Vec<(Key, String)> {
-    let mut first_map: BTreeMap<Key, Vec<&MotionVector>> = BTreeMap::new();
-    for mv in first {
+    // HashMap, not BTreeMap: nothing here depends on sorted iteration order —
+    // `diffs` gets sorted explicitly at the end — so O(1) average lookup beats
+    // the O(log n) tree traversal for large vector counts.
+    let mut first_map: HashMap<Key, Vec<&MotionVector>> = HashMap::new();
+    for mv in first.iter().filter(|mv| !is_zero_size(mv)) {
         first_map.entry(Key::from_mv(mv)).or_default().push(mv);
     }
 
-    let mut second_map: BTreeMap<Key, Vec<&MotionVector>> = BTreeMap::new();
-    for mv in second {
+    let mut second_map: HashMap<Key, Vec<&MotionVector>> = HashMap::new();
+    for mv in second.iter().filter(|mv| !is_zero_size(mv)) {
         second_map.entry(Key::from_mv(mv)).or_default().push(mv);
     }
 
     let mut diffs: Vec<(Key, String)> = Vec::new();
 
-    let all_keys: BTreeMap<&Key, ()> = first_map
-        .keys()
-        .chain(second_map.keys())
-        .map(|k| (k, ()))
-        .collect();
-
-    for key in all_keys.keys() {
-        let first_rows = first_map.get(key);
-        let second_rows = second_map.get(key);
-
-        match (first_rows, second_rows) {
-            (Some(_), None) => {
-                diffs.push((
-                    (*key).clone(),
-                    format!("{}: missing in second file", key.display()),
-                ));
-            }
-            (None, Some(_)) => {
-                diffs.push((
-                    (*key).clone(),
-                    format!("{}: missing in first file", key.display()),
-                ));
-            }
-            (Some(f_rows), Some(s_rows)) => {
-                let count = f_rows.len().max(s_rows.len());
-                for i in 0..count {
-                    if i >= f_rows.len() {
-                        diffs.push((
-                            (*key).clone(),
-                            format!("{}: extra row in second file (index {})", key.display(), i),
-                        ));
-                        continue;
-                    }
-                    if i >= s_rows.len() {
-                        diffs.push((
-                            (*key).clone(),
-                            format!("{}: extra row in first file (index {})", key.display(), i),
-                        ));
-                        continue;
-                    }
-                    let f_vals = ValueColumns::from_mv(f_rows[i]);
-                    let s_vals = ValueColumns::from_mv(s_rows[i]);
-                    for ((col, v1), (_, v2)) in f_vals.fields().iter().zip(s_vals.fields().iter()) {
-                        if v1 != v2 {
-                            diffs.push((
-                                (*key).clone(),
-                                format!(
-                                    "{}: '{}' differs (first={}, second={})",
-                                    key.display(),
-                                    col,
-                                    v1,
-                                    v2
-                                ),
-                            ));
-                        }
-                    }
-                }
-            }
-            (None, None) => unreachable!(),
+    // Two passes over the two maps directly, instead of first collecting a
+    // third union-of-keys map and then re-looking-up both maps per key.
+    for (key, f_rows) in &first_map {
+        match second_map.get(key) {
+            None => diffs.push((key.clone(), format!("{}: missing in second file", key.display()))),
+            Some(s_rows) => compare_rows(key, f_rows, s_rows, &mut diffs),
+        }
+    }
+    for (key, _) in &second_map {
+        if !first_map.contains_key(key) {
+            diffs.push((key.clone(), format!("{}: missing in first file", key.display())));
         }
     }
 

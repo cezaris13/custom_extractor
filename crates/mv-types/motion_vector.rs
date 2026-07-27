@@ -1,5 +1,5 @@
-use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::fs;
+use std::io::Write;
 
 #[derive(Debug, Clone, Default)]
 pub struct MotionVector {
@@ -45,64 +45,115 @@ fn parse_flags(s: &str) -> Option<u64> {
     }
 }
 
+/// Which `MotionVector` field a CSV column position feeds. Precomputed once
+/// from the header row so each row can dispatch fields in a single pass with
+/// an array index instead of `Vec<&str>` + name lookups per row.
+#[derive(Clone, Copy)]
+enum Col {
+    Frame,
+    Source,
+    W,
+    H,
+    SrcX,
+    SrcY,
+    DstX,
+    DstY,
+    Flags,
+    MotionX,
+    MotionY,
+    MotionScale,
+}
+
 pub fn load_motion_vectors(
     csv_file: &str,
 ) -> Result<Vec<MotionVector>, Box<dyn std::error::Error>> {
-    let file = File::open(csv_file)?;
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
+    // Read once instead of allocating a String per line via BufRead::lines();
+    // str::lines() below then borrows &str slices out of `content` for free.
+    let content = fs::read_to_string(csv_file)?;
+    let mut lines = content.lines();
 
-    let header_line = lines.next().ok_or("Empty CSV file")??;
-    let headers: Vec<String> = header_line
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .collect();
+    let header_line = lines.next().ok_or("Empty CSV file")?;
+    let headers: Vec<&str> = header_line.split(',').map(|s| s.trim()).collect();
 
-    let find_col = |name: &str| -> Option<usize> { headers.iter().position(|h| h == name) };
+    let find_col = |name: &str| -> Option<usize> { headers.iter().position(|&h| h == name) };
 
-    let col_frame = find_col("frame").ok_or("Missing 'frame' column")?;
-    let col_src_x = find_col("src_x").ok_or("Missing 'src_x' column")?;
-    let col_src_y = find_col("src_y").ok_or("Missing 'src_y' column")?;
-    let col_dst_x = find_col("dst_x");
-    let col_dst_y = find_col("dst_y");
-    let col_source = find_col("source");
-    let col_w = find_col("w");
-    let col_h = find_col("h");
-    let col_flags = find_col("flags");
-    let col_motion_x = find_col("motion_x");
-    let col_motion_y = find_col("motion_y");
-    let col_motion_scale = find_col("motion_scale");
+    if find_col("frame").is_none() {
+        return Err("Missing 'frame' column".into());
+    }
+    if find_col("src_x").is_none() {
+        return Err("Missing 'src_x' column".into());
+    }
+    if find_col("src_y").is_none() {
+        return Err("Missing 'src_y' column".into());
+    }
 
-    let get_field = |fields: &[&str], idx: Option<usize>| -> Option<f64> {
-        idx.and_then(|i| fields.get(i)).and_then(|s| parse_f64(s))
-    };
+    let mut roles: Vec<Option<Col>> = vec![None; headers.len()];
+    for (name, role) in [
+        ("frame", Col::Frame),
+        ("source", Col::Source),
+        ("w", Col::W),
+        ("h", Col::H),
+        ("src_x", Col::SrcX),
+        ("src_y", Col::SrcY),
+        ("dst_x", Col::DstX),
+        ("dst_y", Col::DstY),
+        ("flags", Col::Flags),
+        ("motion_x", Col::MotionX),
+        ("motion_y", Col::MotionY),
+        ("motion_scale", Col::MotionScale),
+    ] {
+        if let Some(idx) = find_col(name) {
+            roles[idx] = Some(role);
+        }
+    }
 
     let mut vectors = Vec::new();
 
-    for line_result in lines {
-        let line = line_result?;
+    for line in lines {
         if line.trim().is_empty() {
             continue;
         }
 
-        let fields: Vec<&str> = line.split(',').collect();
+        let mut frame_f: Option<f64> = None;
+        let mut source_f: Option<f64> = None;
+        let mut w_f: Option<f64> = None;
+        let mut h_f: Option<f64> = None;
+        let mut src_x_f: Option<f64> = None;
+        let mut src_y_f: Option<f64> = None;
+        let mut dst_x_f: Option<f64> = None;
+        let mut dst_y_f: Option<f64> = None;
+        let mut flags_s: Option<&str> = None;
+        let mut motion_x_f: Option<f64> = None;
+        let mut motion_y_f: Option<f64> = None;
+        let mut motion_scale_f: Option<f64> = None;
 
-        let frame_val = match fields.get(col_frame).and_then(|s| parse_f64(s)) {
-            Some(v) => v,
-            None => continue,
-        };
-        let src_x_val = match fields.get(col_src_x).and_then(|s| parse_f64(s)) {
-            Some(v) => v,
-            None => continue,
-        };
-        let src_y_val = match fields.get(col_src_y).and_then(|s| parse_f64(s)) {
-            Some(v) => v,
-            None => continue,
-        };
+        for (i, field) in line.split(',').enumerate() {
+            let Some(Some(role)) = roles.get(i) else {
+                continue;
+            };
+            match role {
+                Col::Frame => frame_f = parse_f64(field),
+                Col::Source => source_f = parse_f64(field),
+                Col::W => w_f = parse_f64(field),
+                Col::H => h_f = parse_f64(field),
+                Col::SrcX => src_x_f = parse_f64(field),
+                Col::SrcY => src_y_f = parse_f64(field),
+                Col::DstX => dst_x_f = parse_f64(field),
+                Col::DstY => dst_y_f = parse_f64(field),
+                Col::Flags => flags_s = Some(field),
+                Col::MotionX => motion_x_f = parse_f64(field),
+                Col::MotionY => motion_y_f = parse_f64(field),
+                Col::MotionScale => motion_scale_f = parse_f64(field),
+            }
+        }
 
-        let motion_scale_val = get_field(&fields, col_motion_scale).unwrap_or(0.0);
-        let motion_x_val = get_field(&fields, col_motion_x).unwrap_or(0.0);
-        let motion_y_val = get_field(&fields, col_motion_y).unwrap_or(0.0);
+        let Some(frame_val) = frame_f else { continue };
+        let Some(src_x_val) = src_x_f else { continue };
+        let Some(src_y_val) = src_y_f else { continue };
+
+        let motion_scale_val = motion_scale_f.unwrap_or(0.0);
+        let motion_x_val = motion_x_f.unwrap_or(0.0);
+        let motion_y_val = motion_y_f.unwrap_or(0.0);
 
         let derive_dst = |src: f64, motion: f64| -> f64 {
             if motion_scale_val > 0.0 {
@@ -111,22 +162,19 @@ pub fn load_motion_vectors(
                 src
             }
         };
-        let dst_x_val = get_field(&fields, col_dst_x).unwrap_or_else(|| derive_dst(src_x_val, motion_x_val));
-        let dst_y_val = get_field(&fields, col_dst_y).unwrap_or_else(|| derive_dst(src_y_val, motion_y_val));
+        let dst_x_val = dst_x_f.unwrap_or_else(|| derive_dst(src_x_val, motion_x_val));
+        let dst_y_val = dst_y_f.unwrap_or_else(|| derive_dst(src_y_val, motion_y_val));
 
         let mv = MotionVector {
             frame: frame_val as i32,
-            source: get_field(&fields, col_source).unwrap_or(0.0) as i32,
-            w: get_field(&fields, col_w).unwrap_or(0.0) as i32,
-            h: get_field(&fields, col_h).unwrap_or(0.0) as i32,
+            source: source_f.unwrap_or(0.0) as i32,
+            w: w_f.unwrap_or(0.0) as i32,
+            h: h_f.unwrap_or(0.0) as i32,
             src_x: src_x_val,
             src_y: src_y_val,
             dst_x: dst_x_val,
             dst_y: dst_y_val,
-            flags: col_flags
-                .and_then(|i| fields.get(i))
-                .and_then(|s| parse_flags(s))
-                .unwrap_or(0),
+            flags: flags_s.and_then(parse_flags).unwrap_or(0),
             motion_x: motion_x_val,
             motion_y: motion_y_val,
             motion_scale: motion_scale_val,
