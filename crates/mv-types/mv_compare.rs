@@ -37,7 +37,9 @@ impl Key {
 }
 
 /// Zero-size vector: source and destination points coincide (no displacement).
-fn is_zero_size(mv: &MotionVector) -> bool {
+/// `compare_frames` skips these on both sides; callers that report row counts
+/// alongside its diff count must apply the same filter or the two disagree.
+pub fn is_zero_size(mv: &MotionVector) -> bool {
     mv.src_x == mv.dst_x && mv.src_y == mv.dst_y
 }
 
