@@ -19,11 +19,16 @@
 //!
 //! Threading: the demux/NAL-split/parameter-set pass is inherently serial, but a
 //! picture's decode is self-contained (spatial-only MV prediction, no DPB / no
-//! cross-frame reads), so whole frames decode in parallel. The serial path (one
-//! reused `FrameGrids`, lowest memory) is the default; passing the 5th CLI arg
-//! `is_single_threaded = 0` enables a producer → worker-pool → reordering-writer
+//! cross-frame reads), so whole frames decode in parallel. The 5th CLI arg is a
+//! thread count — 1 = serial (one reused `FrameGrids`, lowest memory), 0 = auto,
+//! N = N workers — enabling a producer → worker-pool → reordering-writer
 //! pipeline. Output is byte-identical either way (writer reorders by frame
 //! index). `E9_THREADS` overrides the worker count.
+//!
+//! Note `E9_B_SLICES=1` (which the benchmark sets) forces the serial path
+//! regardless: B-slice direct mode needs the colocated picture's motion field,
+//! which the worker pool doesn't share. That is the binding constraint on this
+//! extractor's throughput — see OPTIMIZATION_ANALYSIS.md §4.
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::ptr;
@@ -89,7 +94,7 @@ fn main() {
                 "extractor9 (thesis): pictures={} cavlc={} cabac={} b_skipped={} b_decoded={} b_unsupported={} threads={}",
                 stats.frames, stats.cavlc_decoded, stats.cabac_decoded, stats.b_skipped,
                 stats.b_decoded, stats.unsupported,
-                if args.is_single_threaded { 1 } else { worker_count() },
+                if args.thread_count == 1 { 1 } else { worker_count(args.thread_count) },
             );
             eprintln!(
                 "  sync: slices_incomplete={} parse_errors={} (both should be 0 on clean CAVLC)",
@@ -251,11 +256,17 @@ fn h264_col_pic(dpb: &[H264RefFrame], cur_poc: i32, nb_l0: usize, nb_l1: usize) 
     l1.first().copied()
 }
 
-fn worker_count() -> usize {
+/// Worker count for the threaded path. `req` is the 5th CLI arg (see
+/// `ExtractorArgs::thread_count`): 0 = auto, 1 = serial, N = N workers.
+/// `E9_THREADS` still wins, for A/B runs without touching the caller.
+fn worker_count(req: i32) -> usize {
     if let Ok(n) = std::env::var("E9_THREADS") {
         if let Ok(n) = n.parse::<usize>() {
             return n.max(1);
         }
+    }
+    if req >= 1 {
+        return req as usize;
     }
     std::thread::available_parallelism().map_or(4, |n| n.get())
 }
@@ -272,7 +283,7 @@ unsafe fn run(
     // B-slice decode needs the DPB of already-decoded reference pictures in
     // POC order, which the parallel worker-pool path doesn't have (workers
     // decode pictures independently, out of order) — force serial.
-    if args.is_single_threaded || args.decode_b_slices {
+    if args.thread_count == 1 || args.decode_b_slices {
         run_serial(args, writer)
     } else {
         run_threaded(args, writer)
@@ -575,7 +586,7 @@ unsafe fn run_threaded(
     args: &ExtractorArgs,
     writer: Option<FileMvCompactWriter>,
 ) -> (Stats, Option<FileMvCompactWriter>) {
-    let nthreads = worker_count();
+    let nthreads = worker_count(args.thread_count);
     // Bounded so the producer can't race ahead and buffer every frame's RBSP in
     // memory; backpressure caps in-flight pictures at ~2x the worker count.
     let (work_tx, work_rx) = mpsc::sync_channel::<Picture>(nthreads * 2);

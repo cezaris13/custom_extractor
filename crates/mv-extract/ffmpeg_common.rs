@@ -24,13 +24,21 @@ use mv_types::motion_vector::MvCompact;
 
 /// CLI arguments shared by every extractor binary.
 ///
-/// Layout: `<input file> <print mv> <output file> <is verbose> <is single threaded>`
+/// Layout: `<input file> <print mv> <output file> <is verbose> <thread count>`
 pub struct ExtractorArgs {
     pub video_file: String,
     pub do_print: bool,
     pub output_file: String,
     pub is_verbose: bool,
-    pub is_single_threaded: bool,
+    /// Worker count: 0 = auto (all cores), 1 = serial, N = N workers.
+    ///
+    /// This used to be parsed as a boolean `is_single_threaded`, but the
+    /// benchmark harness passes a thread *count* here (1, 2, 4 … 128) exactly
+    /// as it does to extractor0..7 — so every non-zero value meant "single
+    /// threaded" and the worker pool below was unreachable from a benchmark
+    /// run at any setting. 0 and 1 keep their previous meaning; only >= 2
+    /// changes behaviour, and only from "serial" to what it says.
+    pub thread_count: i32,
     /// Opt-in H.264 B-slice (bi-predictive) decode. Off by default so the CLI
     /// contract and output stay unchanged for existing callers/scripts;
     /// enabled via `E9_B_SLICES=1` rather than a new positional argument.
@@ -54,7 +62,7 @@ impl ExtractorArgs {
         if argv.len() < 6 {
             let exe = argv.first().cloned().unwrap_or_else(|| "extractor".to_string());
             eprintln!(
-                "Usage: {} <input file> <print mv> <output file> <is verbose> <is single threaded>",
+                "Usage: {} <input file> <print mv> <output file> <is verbose> <thread count>",
                 exe
             );
             return None;
@@ -64,7 +72,7 @@ impl ExtractorArgs {
             do_print: argv[2].parse::<i32>().unwrap_or(0) != 0,
             output_file: argv[3].clone(),
             is_verbose: argv[4].parse::<i32>().unwrap_or(0) != 0,
-            is_single_threaded: argv[5].parse::<i32>().unwrap_or(0) != 0,
+            thread_count: argv[5].parse::<i32>().unwrap_or(0),
             decode_b_slices: std::env::var("E9_B_SLICES").map(|v| v != "0").unwrap_or(false),
             l0_only: std::env::var("E9_L0_ONLY").map(|v| v != "0").unwrap_or(false),
         })
