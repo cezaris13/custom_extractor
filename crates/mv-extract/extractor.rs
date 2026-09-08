@@ -38,7 +38,10 @@ use std::sync::{Arc, Mutex};
 
 use ffmpeg_sys_next as ff;
 
-use mv_extract::ffmpeg_common::{get_current_rss_kb, open_mv_compact_writer, ExtractorArgs, FileMvCompactWriter};
+use mv_extract::ffmpeg_common::{
+    get_current_rss_kb, mv_skip_every_nth, open_mv_compact_writer, ExtractorArgs,
+    FileMvCompactWriter,
+};
 use mv_extract::hevc;
 use mv_extract::custom::slice::{decode_slice, decode_slice_cabac, decode_slice_cabac_b, FrameGrids};
 use mv_extract::custom::{
@@ -564,7 +567,19 @@ unsafe fn run_serial(
     let mut out = Vec::new();
     let mut dpb: Vec<H264RefFrame> = Vec::new();
 
+    // Temporal decimation: drop every Nth picture before it is parsed at all.
+    // Counted in decode order; see mv_skip_every_nth() for the semantics.
+    let skip_nth = mv_skip_every_nth();
+    let mut pic_index: i32 = 0;
+
     let (frames, b_skipped) = demux_pictures(args, |p| {
+        if skip_nth > 1 {
+            let idx = pic_index;
+            pic_index += 1;
+            if idx % skip_nth == 0 {
+                return;
+            }
+        }
         out.clear();
         decode_picture(&p, &mut grid, &mut out, &mut stats, &mut dpb, args.decode_b_slices, args.l0_only);
         if let Some(w) = writer.as_mut() {
@@ -593,6 +608,8 @@ unsafe fn run_threaded(
     let work_rx = Arc::new(Mutex::new(work_rx));
     let (res_tx, res_rx) = mpsc::channel::<(i32, Vec<MvCompact>, Stats)>();
     let l0_only = args.l0_only;
+    // Copied out of the OnceLock so each worker closure captures a plain i32.
+    let skip_nth_par = mv_skip_every_nth();
 
     let mut workers = Vec::with_capacity(nthreads);
     for _ in 0..nthreads {
@@ -605,6 +622,13 @@ unsafe fn run_threaded(
                 // unlocked so workers don't serialise.
                 let job = rx.lock().unwrap().recv();
                 let Ok(p) = job else { break };
+                // Same decimation as the serial path. frame_index is assigned in
+                // decode order upstream, so workers agree on which to drop
+                // without needing a shared counter.
+                if skip_nth_par > 1 && p.frame_index % skip_nth_par == 0 {
+                    let _ = tx.send((p.frame_index, Vec::new(), Stats::default()));
+                    continue;
+                }
                 let mut out = Vec::new();
                 let mut st = Stats::default();
                 // decode_b_slices is never set here: `run()` forces the serial

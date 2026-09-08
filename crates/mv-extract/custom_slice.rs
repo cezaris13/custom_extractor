@@ -15,6 +15,7 @@
 
 use super::cavlc::residual_block;
 use super::{BitReader, Pps, SliceHeader, SliceType, Sps};
+use crate::ffmpeg_common::MvFilter;
 use mv_types::motion_vector::{MotionVector, MvCompact};
 
 const PART_NA: i32 = -2; // PART_NOT_AVAILABLE
@@ -1146,6 +1147,7 @@ impl FrameGrids {
     /// FFmpeg fork's `mv_l0_only` AVOption (see `mpegutils.c`'s
     /// `ff_print_debug_info2_optimized`).
     pub fn export_mvs(&self, frame: i32, l0_only: bool, out: &mut Vec<MotionVector>) {
+        let mut flt = MvFilter::new();
         self.for_each_mv(|sx, sy, w, h, source, mv| {
             if l0_only && source > 0 {
                 return;
@@ -1154,6 +1156,9 @@ impl FrameGrids {
             let src_y = sy + mv[1] / 4;
             if src_x == sx && src_y == sy {
                 return; // zero-size vector: no displacement, skip
+            }
+            if !flt.keep(src_x, src_y, sx, sy, sx, sy) {
+                return; // MV_MIN_SIZE / MV_EVERY_NTH
             }
             out.push(MotionVector {
                 frame,
@@ -1176,6 +1181,7 @@ impl FrameGrids {
     /// (libavcodec add_mb_compact): 6 integer columns, ~5x smaller and faster to
     /// write than the full format. `l0_only`: see `export_mvs`.
     pub fn export_mvs_compact(&self, frame: i32, l0_only: bool, out: &mut Vec<MvCompact>) {
+        let mut flt = MvFilter::new();
         self.for_each_mv(|sx, sy, _w, _h, source, mv| {
             if l0_only && source > 0 {
                 return;
@@ -1184,6 +1190,9 @@ impl FrameGrids {
             let src_y = sy + mv[1] / 4;
             if src_x == sx && src_y == sy {
                 return; // zero-size vector: no displacement, skip
+            }
+            if !flt.keep(src_x, src_y, sx, sy, sx, sy) {
+                return; // MV_MIN_SIZE / MV_EVERY_NTH
             }
             out.push(MvCompact {
                 frame,

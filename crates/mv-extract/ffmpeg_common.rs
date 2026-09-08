@@ -3,6 +3,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::ffi::CString;
 use std::ptr;
+use std::sync::OnceLock;
 
 use ffmpeg_sys_next::{self as ff, AVMotionVector};
 use mv_types::motion_vector::{MotionVector, MotionVectorCsvWriter, MvCompactCsvWriter};
@@ -76,6 +77,96 @@ impl ExtractorArgs {
             decode_b_slices: std::env::var("E9_B_SLICES").map(|v| v != "0").unwrap_or(false),
             l0_only: std::env::var("E9_L0_ONLY").map(|v| v != "0").unwrap_or(false),
         })
+    }
+}
+
+fn env_i32(key: &str) -> i32 {
+    std::env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+}
+
+/// Motion-vector post-filters, shared by the H.264 and HEVC export paths and
+/// mirroring the custom FFmpeg fork's `mv_min_size` / `mv_grid` options (see
+/// `libavcodec/mpegutils.h`'s `FFMvFilter`) so extractor9's output stays
+/// directly comparable with extractor1/3/5/6 under the same settings.
+///
+/// * `MV_MIN_SIZE=N` — drop vectors whose displacement is shorter than N pixels.
+/// * `MV_GRID=N`     — keep at most one vector per N x N pixel cell.
+///
+/// Both default to 0 (off), so an unset environment exports exactly what it did
+/// before these existed. The threshold runs first and the grid second, so a cell
+/// is claimed by a vector that actually passed the threshold.
+///
+/// The grid replaced an earlier "keep 1 of every N vectors in decode order"
+/// filter, which sampled by the macroblock walk and therefore clustered
+/// arbitrarily; cells spread the kept field over the picture instead.
+///
+/// Read directly from the makefile's `MV_GRID`/`MV_MIN_SIZE` (exported via
+/// `BENCH_ENV`, inherited by this process) rather than through an `E9_`-prefixed
+/// relay like `E9_L0_ONLY`. Those relays exist because extractor9's default
+/// differs from the makefile variable's; these are 0-by-default everywhere.
+///
+/// Construct one per export call: the occupancy set must restart each picture.
+/// Skip every Nth picture entirely, in decode order — the counterpart of the
+/// fork's `mv_skip_every_nth`. Unlike the vector filters above this genuinely
+/// saves time: a skipped picture is never parsed.
+///
+/// 0 or 1 decodes everything; 2 drops half, 3 drops a third, 4 a quarter, so
+/// larger N is a *gentler* trim. Skipped pictures cannot be recovered
+/// afterwards, which is why the useful range is a mild one.
+pub fn mv_skip_every_nth() -> i32 {
+    static N: OnceLock<i32> = OnceLock::new();
+    *N.get_or_init(|| env_i32("MV_SKIP_EVERY_NTH"))
+}
+
+pub struct MvFilter {
+    min_size: i32,
+    grid: i32,
+    seen: std::collections::HashSet<(i32, i32)>,
+}
+
+impl MvFilter {
+    pub fn new() -> Self {
+        // Parsed once per process, like `dbg_enabled()`'s E10_DBG in hevc_slice.
+        static PARAMS: OnceLock<(i32, i32)> = OnceLock::new();
+        let (min_size, grid) =
+            *PARAMS.get_or_init(|| (env_i32("MV_MIN_SIZE"), env_i32("MV_GRID")));
+        Self { min_size, grid, seen: std::collections::HashSet::new() }
+    }
+
+    /// `true` to keep the vector, `false` to drop it.
+    ///
+    /// `cur_x`/`cur_y` is the block's position in the CURRENT picture, which the
+    /// grid buckets on. Callers must pass the right endpoint: the H.264 export
+    /// puts the current-picture centre in dst, the HEVC export puts it in src.
+    pub fn keep(
+        &mut self,
+        src_x: i32,
+        src_y: i32,
+        dst_x: i32,
+        dst_y: i32,
+        cur_x: i32,
+        cur_y: i32,
+    ) -> bool {
+        if self.min_size > 0 {
+            let dx = dst_x - src_x;
+            let dy = dst_y - src_y;
+            if dx * dx + dy * dy < self.min_size * self.min_size {
+                return false;
+            }
+        }
+        if self.grid > 0 {
+            // First vector to reach a cell wins; the rest of that cell is dropped.
+            if !self.seen.insert((cur_x / self.grid, cur_y / self.grid)) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl Default for MvFilter {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

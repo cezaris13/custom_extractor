@@ -11,6 +11,7 @@ use crate::hevc::{Pps, SliceHeader, SliceType, Sps};
 use crate::hevc_cabac::{init_states, Cabac};
 use crate::hevc_cabac_tables::*;
 #[allow(unused_imports)]
+use crate::ffmpeg_common::MvFilter;
 use mv_types::motion_vector::MvCompact;
 
 const MODE_INTER: u8 = 0;
@@ -763,6 +764,7 @@ fn export_frame_mvs(cx: &mut Ctx) {
     let max_pu = 255 / min_pu;
     let frame = cx.frame_index;
     let tab = std::mem::take(&mut cx.tab_mvf);
+    let mut flt = MvFilter::new();
     let mut visited = vec![false; mpw * mph];
     for y in 0..mph {
         for x in 0..mpw {
@@ -813,6 +815,9 @@ fn export_frame_mvs(cx: &mut Ctx) {
                 let dst_y = src_y + (m.mv[dir][1] as i32 >> 2);
                 if dst_x == src_x && dst_y == src_y {
                     continue; // zero-size vector: no displacement, skip
+                }
+                if !flt.keep(src_x, src_y, dst_x, dst_y, src_x, src_y) {
+                    continue; // MV_MIN_SIZE / MV_EVERY_NTH
                 }
                 cx.out.push(MvCompact {
                     frame,
